@@ -3,21 +3,7 @@
  * @file           : main.c
  * @brief          : Main program body
  ******************************************************************************
- * CAN Network
- * CAN1 is used, GPIO config: TX = PB9, RX = PB8
- * (Those GPIOs are also used for display, that's why the display is flickering when
- * CAN is used)
- *
- * Temperature sensor DS18B20 has to be connected to 3V3, GND and PG9
- *
- * Exercises are marked with ToDo. There are 2 stages of ToDos:
- * 1) Implement CAN communication with a counter value
- * 2) Add temperature value to CAN payload. ( Marked with ToDo (2) )
- *
- ******************************************************************************
  */
-
-/* Includes ------------------------------------------------------------------*/
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -26,47 +12,24 @@
 #include "stm32f429i_discovery_ts.h"
 #include "ts_calibration.h"
 #include "can.h"
-#include "cancpp.h"
+// #include "cancpp.h" // Nicht mehr benötigt für die reine C-Lösung
 
-/* Private includes ----------------------------------------------------------*/
-
-/* Private typedef -----------------------------------------------------------*/
-
-/* Private define ------------------------------------------------------------*/
-
-/* Private variables ---------------------------------------------------------*/
-
-/* Private function prototypes -----------------------------------------------*/
 static int GetUserButtonPressed(void);
 static int GetTouchState (int *xCoord, int *yCoord);
 
-/**
- * @brief This function handles System tick timer.
- */
 void SysTick_Handler(void)
 {
 	HAL_IncTick();
 }
 
-/**
- * @brief  The application entry point.
- * @retval int
- */
 int main(void)
 {
-	/* MCU Configuration--------------------------------------------------------*/
-	/* Reset of all peripherals, Initializes the Flash interface and the Systick. */
 	HAL_Init();
-	/* Configure the system clock */
 	SystemClock_Config();
 
-	/* Initialize LCD and touch screen */
 	LCD_Init();
 	TS_Init(LCD_GetXSize(), LCD_GetYSize());
-	/* touch screen calibration */
-	//	TS_Calibration();
 
-	/* Clear the LCD and display basic starter text */
 	LCD_Clear(LCD_COLOR_BLACK);
 	LCD_SetTextColor(LCD_COLOR_YELLOW);
 	LCD_SetBackColor(LCD_COLOR_BLACK);
@@ -75,25 +38,34 @@ int main(void)
 	printf("HTL Wels");
 
 	LCD_SetFont(&Font8);
-	LCD_SetColors(LCD_COLOR_MAGENTA, LCD_COLOR_BLACK); // TextColor, BackColor
-	LCD_DisplayStringAtLineMode(39, "copyright CAN Experts!", CENTER_MODE);
+	LCD_SetColors(LCD_COLOR_MAGENTA, LCD_COLOR_BLACK);
+	LCD_DisplayStringAtLineMode(39, "copyright Sammer!", CENTER_MODE);
 
 	// ToDo: set up CAN peripherals
+	// Wir nutzen jetzt die Funktion aus can.c
+	canInit();
 
+	static int lastButtonState = 0;
 
-
-	/* Infinite loop */
 	while (1)
 	{
-		//execute main loop every 100ms
-		HAL_Delay(10);
+		HAL_Delay(10); // Entprellzeit und Schleifendauer
 
-		// ToDo: send data over CAN when user button has been pressed
+		int currentButtonState = GetUserButtonPressed();
 
+		// **KORRIGIERTE LOGIK: Flankenerkennung**
+		// Senden nur, wenn:
+		// 1. Der aktuelle Zustand ist GEDRÜCKT (currentButtonState == 1)
+		// UND
+		// 2. Der letzte Zustand war NICHT GEDRÜCKT (!lastButtonState == 0)
+		if (currentButtonState && !lastButtonState) {
+			canSendTask();
+		}
 
+		// Zustand für den nächsten Durchlauf speichern
+		lastButtonState = currentButtonState;
 
-		// ToDo: check if data has been received
-
+		canReceiveTask();
 
 		// display timer
 		int cnt = HAL_GetTick();
@@ -107,28 +79,14 @@ int main(void)
 		if (GetTouchState(&x, &y)) {
 			LCD_FillCircle(x, y, 5);
 		}
-
-
 	}
 }
 
-/**
- * Check if User Button has been pressed
- * @param none
- * @return 1 if user button input (PA0) is high
- */
 static int GetUserButtonPressed(void) {
 	return (GPIOA->IDR & 0x0001);
 }
 
-/**
- * Check if touch interface has been used
- * @param xCoord x coordinate of touch event in pixels
- * @param yCoord y coordinate of touch event in pixels
- * @return 1 if touch event has been detected
- */
 static int GetTouchState (int* xCoord, int* yCoord) {
-	void    BSP_TS_GetState(TS_StateTypeDef *TsState);
 	TS_StateTypeDef TsState;
 	int touchclick = 0;
 
@@ -142,8 +100,5 @@ static int GetTouchState (int* xCoord, int* yCoord) {
 			*yCoord = TS_Calibration_GetY(*yCoord);
 		}
 	}
-
 	return touchclick;
 }
-
-
