@@ -2,22 +2,64 @@
  ******************************************************************************
  * @file           : can.c
  * @brief          : CAN handling functions
+ * @author: L. Hubmer
  ******************************************************************************
  */
+
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
 #include "main.h"
 #include "stm32f429i_discovery_lcd.h"
 #include "tempsensor.h"
-#include <string.h>
-// ToDo: korrekte Prescaler-Einstellung
-// 45 MHz / (22 * 16) = ~128 kBit/s
-#define   CAN1_CLOCK_PRESCALER    16  //
+#include "ringbuffer.h"
 
-CAN_HandleTypeDef     canHandle;
+/* Private define ------------------------------------------------------------*/
+#define CAN1_CLOCK_PRESCALER  16   // Adjust for correct bitrate
 
+/* Private variables ---------------------------------------------------------*/
+CAN_HandleTypeDef canHandle;
+uint8_t OtherTransmissionInProgress = 0;
+
+/* TX/RX buffers */
+static CAN_TxHeaderTypeDef txHeader;
+static uint8_t  txData[8];
+static uint32_t txMailbox;
+
+static CAN_RxHeaderTypeDef rxHeader;
+static uint8_t  rxData[8];
+
+#define CAN_RX_MSG_BUFFER_LEN 256
+
+static RingBuffer_t CanRxMsgStdId;
+static RingBuffer_t CanRxMsgByte0;
+static RingBuffer_t CanRxMsgByte1;
+static RingBuffer_t CanRxMsgByte2;
+static RingBuffer_t CanRxMsgByte3;
+static RingBuffer_t CanRxMsgByte4;
+static RingBuffer_t CanRxMsgByte5;
+static RingBuffer_t CanRxMsgByte6;
+static RingBuffer_t CanRxMsgByte7;
+
+static uint8_t CanRxMsgStdId_Array[CAN_RX_MSG_BUFFER_LEN] = {0};
+static uint8_t CanRxMsgByte0_Array[CAN_RX_MSG_BUFFER_LEN] = {0};
+static uint8_t CanRxMsgByte1_Array[CAN_RX_MSG_BUFFER_LEN] = {0};
+static uint8_t CanRxMsgByte2_Array[CAN_RX_MSG_BUFFER_LEN] = {0};
+static uint8_t CanRxMsgByte3_Array[CAN_RX_MSG_BUFFER_LEN] = {0};
+static uint8_t CanRxMsgByte4_Array[CAN_RX_MSG_BUFFER_LEN] = {0};
+static uint8_t CanRxMsgByte5_Array[CAN_RX_MSG_BUFFER_LEN] = {0};
+static uint8_t CanRxMsgByte6_Array[CAN_RX_MSG_BUFFER_LEN] = {0};
+static uint8_t CanRxMsgByte7_Array[CAN_RX_MSG_BUFFER_LEN] = {0};
+
+
+/* Private function prototypes -----------------------------------------------*/
 static void initGpio(void);
 static void initCanPeripheral(void);
+void canSaveToBuffer();
+
+/**
+ * Initialize GPIO and CAN peripheral
+ */
 
 void canInitHardware(void) {
 	initGpio();
@@ -25,351 +67,239 @@ void canInitHardware(void) {
 }
 
 /**
- * canInit function, set up hardware and display
+ * CAN initialization (including display)
  */
 void canInit(void) {
+
 	canInitHardware();
+
+	ringBufferInit(&CanRxMsgStdId, CanRxMsgStdId_Array, CAN_RX_MSG_BUFFER_LEN);
+	ringBufferInit(&CanRxMsgByte0, CanRxMsgByte0_Array, CAN_RX_MSG_BUFFER_LEN);
+	ringBufferInit(&CanRxMsgByte1, CanRxMsgByte1_Array, CAN_RX_MSG_BUFFER_LEN);
+	ringBufferInit(&CanRxMsgByte2, CanRxMsgByte2_Array, CAN_RX_MSG_BUFFER_LEN);
+	ringBufferInit(&CanRxMsgByte3, CanRxMsgByte3_Array, CAN_RX_MSG_BUFFER_LEN);
+	ringBufferInit(&CanRxMsgByte4, CanRxMsgByte4_Array, CAN_RX_MSG_BUFFER_LEN);
+	ringBufferInit(&CanRxMsgByte5, CanRxMsgByte5_Array, CAN_RX_MSG_BUFFER_LEN);
+	ringBufferInit(&CanRxMsgByte6, CanRxMsgByte6_Array, CAN_RX_MSG_BUFFER_LEN);
+	ringBufferInit(&CanRxMsgByte7, CanRxMsgByte7_Array, CAN_RX_MSG_BUFFER_LEN);
+
 
 	LCD_SetFont(&Font12);
 	LCD_SetColors(LCD_COLOR_WHITE, LCD_COLOR_BLACK);
 	LCD_SetPrintPosition(3,1);
-	printf("CAN1: Send-Recv (C-Impl)"); // Hinweis auf C-Version
+	printf("CAN1: Send-Recv");
 
 	LCD_SetColors(LCD_COLOR_GREEN, LCD_COLOR_BLACK);
 	LCD_SetPrintPosition(5,1);
 	printf("Send-Cnt:");
 	LCD_SetPrintPosition(5,15);
 	printf("%5d", 0);
+
 	LCD_SetPrintPosition(7,1);
 	printf("Recv-Cnt:");
 	LCD_SetPrintPosition(7,15);
 	printf("%5d", 0);
+
 	LCD_SetPrintPosition(9,1);
 	printf("Send-Data:");
+
 	LCD_SetPrintPosition(15,1);
 	printf("Recv-Data:");
 
 	LCD_SetPrintPosition(30,1);
 	printf("Bit-Timing-Register: 0x%lx", CAN1->BTR);
 
-	// ToDo (2): set up DS18B20 (temperature sensor)
-	tempSensorInit(); //
+
+
+	/* ----------------------
+	 * Initialize DS18B20
+	 * --------------------- */
+	//   ds18b20_init();
+	//   ds18b20_startMeasure();
 }
 
 /**
- * sends a CAN frame, if mailbox is free
+ * Task: Send a CAN message every cycle
  */
-void canSendTask(void) {
 
 
-	// can.c - canSendTask angepasst
+void canSendLetter(char Letter, uint16_t check_number) {
+	static unsigned int sendCnt = 0;
 
-	static uint8_t sendCnt = 0;
-	CAN_TxHeaderTypeDef txHeader;
-	uint8_t txData[8] = {0};
-	uint32_t txMailbox;
+//	while(OtherTransmissionInProgress)	{};
 
-	// 1. Sensordaten holen
-	float temp = tempSensorGetTemperature();
-	uint16_t tempScaled = (uint16_t)(temp * 10);
-	char myName[] = "Jonas"; // Max. 5 Zeichen für diese Aufteilung
+	/* Prepare CAN header */
+	txHeader.StdId = 0x003;
+	txHeader.IDE   = CAN_ID_STD;
+	txHeader.RTR   = CAN_RTR_DATA;
+	txHeader.DLC   = 3;
 
-	if (HAL_CAN_GetTxMailboxesFreeLevel(&canHandle) == 0) return;
+	/* Data payload (temperature) */
+	txData[0] = Letter;
+	txData[1] = ((uint8_t)check_number >> 8) & 0xFF;
+	txData[2] = (uint8_t)check_number & 0xFF;
 
-	// 2. Datenpaket "packen"
-	// Bytes 0-4: Name kopieren
-	strncpy((char*)txData, myName, 5);
 
-	// Byte 5: Zähler
-	txData[5] = sendCnt;
 
-	// Byte 6-7: Temperatur (Little Endian)
-	txData[6] = (uint8_t)(tempScaled & 0xFF);
-	txData[7] = (uint8_t)((tempScaled >> 8) & 0xFF);
-
-	// 3. CAN Header
-	txHeader.StdId = 0x0F5;
-	txHeader.DLC = 8;
-	txHeader.IDE = CAN_ID_STD;
-	txHeader.RTR = CAN_RTR_DATA;
-
+	/* Send CAN frame */
 	if (HAL_CAN_AddTxMessage(&canHandle, &txHeader, txData, &txMailbox) == HAL_OK) {
 		sendCnt++;
+
+		/* Display send counter */
+		LCD_SetColors(LCD_COLOR_GREEN, LCD_COLOR_BLACK);
+		LCD_SetPrintPosition(5,15);
+		printf("%5d", sendCnt);
+
+		/* Display temperature sent */
+		LCD_SetPrintPosition(9,1);
+		printf("Send-Data: %c",txData[0]);
 	}
+}
 
-	// 4. Anzeige (Lokal)
-	LCD_SetColors(LCD_COLOR_GREEN, LCD_COLOR_BLACK);
-	LCD_SetPrintPosition(5, 15); printf("%5d", sendCnt);
-	LCD_SetPrintPosition(11, 1); printf("Gesendet: %s, %.1fC", myName, temp);
+void canSendBegin(char Sender[8]) {
+	static unsigned int sendCnt = 0;
+//	while(OtherTransmissionInProgress){};
 
+	/* Prepare CAN header */
+	txHeader.StdId = 0x001;
+	txHeader.IDE   = CAN_ID_STD;
+	txHeader.RTR   = CAN_RTR_DATA;
+	txHeader.DLC   = 8;
 
-
-
-	/*
-
-	static uint8_t sendCnt = 0; // Wir nutzen den Zähler nur noch für die Statistik
-	CAN_TxHeaderTypeDef txHeader;
-	uint8_t txData[8] = {0}; // Leeres Array mit 0 füllen
-	uint32_t txMailbox;
-
-	// 1. Namen festlegen (Maximal 8 Zeichen!)
-	// Ändern Sie diesen Namen für das jeweilige Board (z.B. "Max", "Lisa")
-	char myName[] = "Jonas";
-
-	// Prüfen, ob eine Mailbox frei ist
-	if (HAL_CAN_GetTxMailboxesFreeLevel(&canHandle) == 0) {
-		return;
-	}
-
-	// 2. Datenpaket vorbereiten (String in Byte-Array kopieren)
-	// Wir kopieren maximal 8 Zeichen in txData.
-	// Wenn der Name kürzer ist, bleiben die restlichen Bytes 0 (Null-Terminator).
-	strncpy((char*)txData, myName, 8);
-
-	// 3. Header konfigurieren
-	txHeader.StdId = 0x0F5;
-	txHeader.ExtId = 0x00;
-	txHeader.RTR = CAN_RTR_DATA;
-	txHeader.IDE = CAN_ID_STD;
-	txHeader.DLC = 8;            // Wir nutzen jetzt immer volle 8 Bytes
-
-	// 4. Senden
-	if (HAL_CAN_AddTxMessage(&canHandle, &txHeader, txData, &txMailbox) == HAL_OK)
+	/* Data payload (temperature) */
+	for( int i = 0; i < 8; i++)
 	{
+		txData[i] = Sender[i];
+	}
+
+
+	/* Send CAN frame */
+	if (HAL_CAN_AddTxMessage(&canHandle, &txHeader, txData, &txMailbox) == HAL_OK) {
 		sendCnt++;
+
+		/* Display send counter */
+		LCD_SetColors(LCD_COLOR_GREEN, LCD_COLOR_BLACK);
+		LCD_SetPrintPosition(5,15);
+		printf("%5d", sendCnt);
+
+		/* Display temperature sent */
+		LCD_SetPrintPosition(9,1);
+		printf("Send-Data: %c",txData[0]);
 	}
-
-	// 5. Anzeige aktualisieren
-	LCD_SetColors(LCD_COLOR_GREEN, LCD_COLOR_BLACK);
-
-	// Zähler anzeigen
-	LCD_SetPrintPosition(5, 15);
-	printf("%5d", sendCnt);
-
-	// Den gesendeten Namen anzeigen
-	LCD_SetPrintPosition(11, 1);
-	// %.8s bedeutet: Drucke String, aber maximal 8 Zeichen (Sicherheitsmaßnahme)
-	printf("Name: %.8s      ", txData);
-
-	// Rohdaten (Hex) anzeigen, um die ASCII-Codes zu sehen
-	LCD_SetPrintPosition(9, 13);
-	printf("%02x %02x %02x %02x...", txData[0], txData[1], txData[2], txData[3]);
-	 */
-	/* Temparatur schicken
-
-	// ToDo declare the required variables
-	static uint8_t sendCnt = 0;
-	CAN_TxHeaderTypeDef txHeader;
-	uint8_t txData[8] = {0};
-	uint32_t txMailbox;
-	float temperature = 0.0f;
-	uint16_t tempScaled = 0;
-
-	// Prüfen, ob eine Mailbox frei ist (mindestens 1 von 3)
-	if (HAL_CAN_GetTxMailboxesFreeLevel(&canHandle) == 0) {
-		return; // Keine Mailbox frei, abbrechen
-	}
-
-	// ToDo (2): get temperature value
-	temperature = tempSensorGetTemperature(); //
-
-	// Temperatur skalieren (z.B. 25.5°C -> 255)
-	tempScaled = (uint16_t)(temperature * 10);
-
-	// ToDo prepare send data
-	// Frame-Aufbau laut Aufgabenstellung:
-	// Byte 0: 0xAF
-	// Byte 1: Vorwärtszähler
-	// Byte 2+3: Temperatur (Stufe 2)
-	txData[0] = 0xAF;      //
-	txData[1] = sendCnt;   //
-	txData[2] = (uint8_t)(tempScaled & 0xFF);      // Low Byte
-	txData[3] = (uint8_t)((tempScaled >> 8) & 0xFF); // High Byte
-
-	// Header konfigurieren
-	txHeader.StdId = 0x002;         //Nr. 2
-	txHeader.ExtId = 0x00;
-	txHeader.RTR = CAN_RTR_DATA;
-	txHeader.IDE = CAN_ID_STD;
-	txHeader.DLC = 4;               // Länge: 4 Bytes
-
-	// ToDo send CAN frame
-	if (HAL_CAN_AddTxMessage(&canHandle, &txHeader, txData, &txMailbox) == HAL_OK)
-	{
-		sendCnt++; // Nur erhöhen, wenn erfolgreich in Mailbox gelegt
-	}
-
-	// ToDo display send counter and send data
-	LCD_SetColors(LCD_COLOR_GREEN, LCD_COLOR_BLACK);
-
-	// Zähler anzeigen
-	LCD_SetPrintPosition(5, 15);
-	printf("%5d", sendCnt);
-
-	// Temperatur Text anzeigen
-	LCD_SetPrintPosition(11, 1);
-	printf("T: %3.2f C", temperature);
-
-	// Datenbytes anzeigen (Hex)
-	LCD_SetPrintPosition(9, 13); // Zeile 9, hinter "Send-Data:"
-	printf("%02x %02x %02x %02x", txData[0], txData[1], txData[2], txData[3]);
-
-	 */
 }
+void canSendEnd() {
+	static unsigned int sendCnt = 0;
+//	while(OtherTransmissionInProgress){};
 
+	/* Prepare CAN header */
+	txHeader.StdId = 0x002;
+	txHeader.IDE   = CAN_ID_STD;
+	txHeader.RTR   = CAN_RTR_DATA;
+	txHeader.DLC   = 1;
+
+	/* Data payload (temperature) */
+	txData[0] = 'E';
+
+
+	/* Send CAN frame */
+	if (HAL_CAN_AddTxMessage(&canHandle, &txHeader, txData, &txMailbox) == HAL_OK) {
+		sendCnt++;
+
+		/* Display send counter */
+		LCD_SetColors(LCD_COLOR_GREEN, LCD_COLOR_BLACK);
+		LCD_SetPrintPosition(5,15);
+		printf("%5d", sendCnt);
+
+		/* Display temperature sent */
+		LCD_SetPrintPosition(9,1);
+		printf("Send-Data: %c",txData[0]);
+	}
+}
 /**
- * checks if a can frame has been received and shows content on display
+ * Task: Receive CAN messages if available
  */
-void canReceiveTask(void) {
-
-
-	// can.c - canReceiveTask angepasst
-
-	    static unsigned int recvTotal = 0;
-	    CAN_RxHeaderTypeDef rxHeader;
-	    uint8_t rxData[8] = {0};
-
-	    if (HAL_CAN_GetRxFifoFillLevel(&canHandle, CAN_RX_FIFO0) != 0) {
-	        if (HAL_CAN_GetRxMessage(&canHandle, CAN_RX_FIFO0, &rxHeader, rxData) == HAL_OK) {
-	            recvTotal++;
-
-	            // --- Extraktion (Entpacken) ---
-
-	            // Name: Die ersten 5 Bytes (wir brauchen einen Puffer mit \0 am Ende)
-	            char rName[6] = {0};
-	            strncpy(rName, (char*)rxData, 5);
-
-	            // Zähler: Byte 5
-	            uint8_t rCnt = rxData[5];
-
-	            // Temperatur: Byte 6 und 7
-	            uint16_t rTempRaw = (uint16_t)rxData[6] | ((uint16_t)rxData[7] << 8);
-	            float rTemp = (float)rTempRaw / 10.0f;
-
-	            // --- Anzeige am LCD ---
-	            LCD_SetColors(LCD_COLOR_CYAN, LCD_COLOR_BLACK);
-	            LCD_SetPrintPosition(15, 1);
-	            printf("RX von: %s (#%d)", rName, rCnt);
-
-	            LCD_SetPrintPosition(17, 1);
-	            printf("Temp:  %.1f C", rTemp);
-
-	            LCD_SetPrintPosition(7, 15);
-	            printf("%5d", recvTotal);
-	        }
-	    }
-
-
-
-
-
-
-	/*
-
+void canReceiveTask(RingBuffer_t* MsgRecieve) {
 	static unsigned int recvCnt = 0;
-	CAN_RxHeaderTypeDef rxHeader;
-	uint8_t rxData[8] = {0};
+	static uint16_t PrevCheckNumber;
 
-	// Prüfen, ob Daten da sind
-	if (HAL_CAN_GetRxFifoFillLevel(&canHandle, CAN_RX_FIFO0) != 0)
+	/* Check for RX pending */
+	if (ringBufferLen(&CanRxMsgByte0) == 0)
+		return;
+
+	recvCnt++;
+
+	uint8_t RxDataStdId = ringBufferGetOne(&CanRxMsgStdId);
+	uint8_t RxDataByte[8];
+	RxDataByte[0] = ringBufferGetOne(&CanRxMsgByte0);
+	RxDataByte[1] = ringBufferGetOne(&CanRxMsgByte1);
+	RxDataByte[2] = ringBufferGetOne(&CanRxMsgByte2);
+	RxDataByte[3] = ringBufferGetOne(&CanRxMsgByte3);
+	RxDataByte[4] = ringBufferGetOne(&CanRxMsgByte4);
+	RxDataByte[5] = ringBufferGetOne(&CanRxMsgByte5);
+	RxDataByte[6] = ringBufferGetOne(&CanRxMsgByte6);
+	RxDataByte[7] = ringBufferGetOne(&CanRxMsgByte7);
+
+	/* Extract temperature */
+	int16_t checkNumber = (RxDataByte[1] << 8) | RxDataByte[2];
+	int16_t Head = RxDataStdId;
+
+
+	LCD_SetColors(LCD_COLOR_GREEN, LCD_COLOR_BLACK);
+	LCD_SetPrintPosition(7,15);
+	printf("%5d", recvCnt);
+
+	LCD_SetPrintPosition(15,1);
+	printf("Recv-Data: %02X %02X %02X %02X ",rxData[0], rxData[1], rxData[2], rxData[3]);
+	LCD_SetPrintPosition(16,1);
+	printf("Recv-Data: %c %c %c %c ",rxData[0], rxData[1], rxData[2], rxData[3]);
+	LCD_SetPrintPosition(17,1);
+	printf("Recv-Head: 0x%04X ",Head);
+
+	//If recieving a Begin
+
+	if(RxDataStdId == 0x001)
 	{
-		// Daten abholen
-		if (HAL_CAN_GetRxMessage(&canHandle, CAN_RX_FIFO0, &rxHeader, rxData) == HAL_OK)
+		//ringBufferAppendOne(MsgRecieve, '\n');
+		ringBufferAppendOne(MsgRecieve, '<');
+		for(int i = 0; i < 8; i++)
 		{
-			recvCnt++;
-
-			// --- Anzeige ---
-			LCD_SetColors(LCD_COLOR_GREEN, LCD_COLOR_BLACK);
-
-			// Empfangszähler
-			LCD_SetPrintPosition(7, 15);
-			printf("%5d", recvCnt);
-
-			// 1. Empfangenen NAMEN als Text anzeigen
-			LCD_SetPrintPosition(17, 1);
-			// Wir nutzen "%.8s", da rxData evtl. kein Null-Terminierung hat,
-			// wenn der Sender volle 8 Zeichen geschickt hat.
-			printf("Von: %.8s        ", rxData);
-
-			// Zeile 19 (ehemals Temperatur) leeren
-			LCD_SetPrintPosition(19, 1);
-			printf("                   ");
-
-			// 2. Rohdaten (Hex) anzeigen
-			LCD_SetPrintPosition(15, 13);
-			// Nur die ersten 4 Bytes als Hex anzeigen (Platzmangel)
-			printf("%02x %02x %02x %02x...", rxData[0], rxData[1], rxData[2], rxData[3]);
+			ringBufferAppendOne(MsgRecieve, RxDataByte[i]);
 		}
+		ringBufferAppendOne(MsgRecieve, '>');
+		ringBufferAppendOne(MsgRecieve, ':');
+		ringBufferAppendOne(MsgRecieve, ' ');
 	}
-
-	*/
-	/* Temperatur
-	static unsigned int recvCnt = 0;
-	CAN_RxHeaderTypeDef rxHeader;
-	uint8_t rxData[8] = {0};
-
-	// NEU: Variablen zur Speicherung der decodierten Werte
-	uint8_t receivedCounter = 0;
-	uint16_t receivedTempScaled = 0;
-	float receivedTemperature = 0.0f;
-
-
-
-
-	// ToDo: check if CAN frame has been received
-	// Prüfen, ob Füllstand von FIFO0 ungleich 0 ist
-	if (HAL_CAN_GetRxFifoFillLevel(&canHandle, CAN_RX_FIFO0) != 0)
+	//If recieving an End
+	if(RxDataStdId == 0x002)
 	{
-		// ToDo: Get CAN frame from RX fifo
-		if (HAL_CAN_GetRxMessage(&canHandle, CAN_RX_FIFO0, &rxHeader, rxData) == HAL_OK)
-		        {
-		            // ToDo: Process received CAN Frame (extract data)
-		            recvCnt++;
+		PrevCheckNumber = 0;
+		ringBufferAppendOne(MsgRecieve,'\n');
+	}
 
-		            // --- DECODIERUNG DER DATEN ---
-
-		            // 1. Zählerwert: Byte 1 (rxData[1]) enthält den Zähler
-		            receivedCounter = rxData[1];
-
-		            // 2. Temperaturwert: Bytes 2 und 3 zusammenfügen (Low Byte + High Byte)
-		            // Daten[2] ist Low Byte, Daten[3] ist High Byte (Little Endian Konvention im Sender)
-		            receivedTempScaled = (uint16_t)rxData[2] | ((uint16_t)rxData[3] << 8);
-
-		            // 3. Temperatur zurückrechnen: Wir haben mit 10 multipliziert, also jetzt durch 10 teilen
-		            receivedTemperature = (float)receivedTempScaled / 10.0f;
-
-		            // --- ENDE DECODIERUNG ---
-
-		            // ToDo display recv counter and recv data
-		            LCD_SetColors(LCD_COLOR_GREEN, LCD_COLOR_BLACK);
-
-		            // Empfangszähler aktualisieren
-		            LCD_SetPrintPosition(7, 15);
-		            printf("%5d", recvCnt);
-
-		            // NEU: Anzeige der decodierten, verständlichen Werte
-		            LCD_SetPrintPosition(17, 1);
-		            printf("ID: %03lx | Cnt: %3d", rxHeader.StdId, receivedCounter);
-
-		            // Temperaturwert anzeigen
-		            LCD_SetPrintPosition(19, 1);
-		            printf("T: %3.2f C", receivedTemperature);
-
-		            // Hex-Daten zum Vergleich (optional, aber hilfreich):
-		            LCD_SetPrintPosition(15, 1);
-		            printf("Recv-Data: %02x %02x %02x %02x", rxData[0], rxData[1], rxData[2], rxData[3]);
-
+	//If recieveing a letter send to uart
+	if(RxDataStdId == 0x003)
+	{
+		if(PrevCheckNumber + 1 == checkNumber)
+		{
+			ringBufferAppendOne(MsgRecieve, RxDataByte[0]);
+			PrevCheckNumber = checkNumber;
+		}else
+		{
+			LCD_SetPrintPosition(22,1);
+			printf("Lost Letter ERROR");
 		}
 	}
 
-	 */
 }
 
-// ... initGpio und initCanPeripheral bleiben gleich wie im vorherigen Code ...
-static void initGpio(void)
-{
-	GPIO_InitTypeDef  canPins;
+/*
+ * Initialize GPIO pins PB8 (RX) and PB9 (TX)
+ */
+static void initGpio(void) {
+	GPIO_InitTypeDef canPins;
+
 	__HAL_RCC_GPIOB_CLK_ENABLE();
+
 	canPins.Alternate = GPIO_AF9_CAN1;
 	canPins.Mode = GPIO_MODE_AF_OD;
 	canPins.Pin = GPIO_PIN_8 | GPIO_PIN_9;
@@ -378,8 +308,13 @@ static void initGpio(void)
 	HAL_GPIO_Init(GPIOB, &canPins);
 }
 
+/**
+ * Initialize CAN peripheral
+ */
 static void initCanPeripheral(void) {
+
 	CAN_FilterTypeDef canFilter;
+
 	__HAL_RCC_CAN1_CLK_ENABLE();
 
 	canHandle.Instance = CAN1;
@@ -391,12 +326,15 @@ static void initCanPeripheral(void) {
 	canHandle.Init.TransmitFifoPriority = DISABLE;
 	canHandle.Init.Mode = CAN_MODE_NORMAL;
 	canHandle.Init.SyncJumpWidth = CAN_SJW_1TQ;
+
 	canHandle.Init.TimeSeg1 = CAN_BS1_15TQ;
 	canHandle.Init.TimeSeg2 = CAN_BS2_6TQ;
 	canHandle.Init.Prescaler = CAN1_CLOCK_PRESCALER;
 
-	if (HAL_CAN_Init(&canHandle) != HAL_OK) { Error_Handler(); }
+	if (HAL_CAN_Init(&canHandle) != HAL_OK)
+		Error_Handler();
 
+	/* Accept all messages */
 	canFilter.FilterBank = 0;
 	canFilter.FilterMode = CAN_FILTERMODE_IDMASK;
 	canFilter.FilterScale = CAN_FILTERSCALE_32BIT;
@@ -408,14 +346,58 @@ static void initCanPeripheral(void) {
 	canFilter.FilterActivation = ENABLE;
 	canFilter.SlaveStartFilterBank = 14;
 
-	if (HAL_CAN_ConfigFilter(&canHandle, &canFilter) != HAL_OK) { Error_Handler(); }
-	if (HAL_CAN_Start(&canHandle) != HAL_OK) { Error_Handler(); }
+	if (HAL_CAN_ConfigFilter(&canHandle, &canFilter) != HAL_OK)
+		Error_Handler();
+
+	if (HAL_CAN_Start(&canHandle) != HAL_OK)
+		Error_Handler();
+
+	//Activate Rx Interrupt
+	if (HAL_CAN_ActivateNotification(&canHandle, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK)
+	{
+		printf("/* Notification Error */\r\n");
+		Error_Handler();
+	}
+	HAL_NVIC_SetPriority(CAN1_RX0_IRQn, 5, 0);
+	HAL_NVIC_EnableIRQ(CAN1_RX0_IRQn);
 }
 
+/**
+ * CAN RX interrupt handler
+ */
 void CAN1_RX0_IRQHandler(void) {
 	HAL_CAN_IRQHandler(&canHandle);
+
 }
 
+/**
+ * FIFO0 message pending callback (unused)
+ */
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
-	// Receive is done in main loop via Polling
+	//Save Message in Ringbuffer
+	canSaveToBuffer();
+
+
+}
+
+void canSaveToBuffer() {
+	//Save Message in Ringbuffer
+
+	if(HAL_CAN_GetRxMessage(&canHandle, CAN_RX_FIFO0, &rxHeader, rxData) != HAL_OK)
+		return;
+	ringBufferAppendOne(&CanRxMsgStdId, rxHeader.StdId);
+	ringBufferAppendOne(&CanRxMsgByte0, rxData[0]);
+	ringBufferAppendOne(&CanRxMsgByte1, rxData[1]);
+	ringBufferAppendOne(&CanRxMsgByte2, rxData[2]);
+	ringBufferAppendOne(&CanRxMsgByte3, rxData[3]);
+	ringBufferAppendOne(&CanRxMsgByte4, rxData[4]);
+	ringBufferAppendOne(&CanRxMsgByte5, rxData[5]);
+	ringBufferAppendOne(&CanRxMsgByte6, rxData[6]);
+	ringBufferAppendOne(&CanRxMsgByte7, rxData[7]);
+
+	if(rxHeader.StdId == 0x001)
+		OtherTransmissionInProgress = 1;
+
+	if(rxHeader.StdId == 0x003)
+		OtherTransmissionInProgress = 0;
 }
